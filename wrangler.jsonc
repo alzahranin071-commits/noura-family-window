@@ -1,0 +1,18 @@
+{
+  // نافذة الأسرة — إعدادات Cloudflare Workers
+  "name": "noura-family-window",
+  "main": "src/worker.js",
+  "compatibility_date": "2025-09-01",
+  "assets": {
+    "directory": "./public"
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "nafidha-db",
+      // ضعي هنا رقم قاعدة البيانات (Database ID) من لوحة Cloudflare
+      "database_id": "ضعي-رقم-قاعدة-البيانات-هنا"
+    }
+  ],
+  "observability": { "enabled": true }
+}
