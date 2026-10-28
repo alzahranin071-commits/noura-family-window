@@ -11,7 +11,7 @@
       "binding": "DB",
       "database_name": "nafidha-db",
       // ضعي هنا رقم قاعدة البيانات (Database ID) من لوحة Cloudflare
-      "database_id": "ضعي-رقم-قاعدة-البيانات-هنا"
+      "2ae4a104-6d36-4471-b082-53b3fa506b52": "ضعي-رقم-قاعدة-البيانات-هنا"
     }
   ],
   "observability": { "enabled": true }
