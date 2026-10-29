@@ -6,6 +6,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>نافذة الأسرة</title>
 <meta name="claude:viewport-fit-sides" content="cover">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'sha256-OYAbhPUsOryfaVKrvKy2SKzk9/A4IE0QqX8uGp/vxYM='; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com data:; img-src 'self' data: blob:; connect-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'">
 <meta name="author" content="أ. نوره سعد الزهراني">
 <meta name="copyright" content="جميع الحقوق محفوظة لـ أ. نوره سعد الزهراني">
 <meta name="description" content="نافذة الأسرة: مرجع تفاعلي لأولياء أمور الطالبات ذوات صعوبات التعلم - الابتدائية الحادية والخمسون">
@@ -773,8 +774,8 @@ var FONTS = {
 };
 var FONT_LABELS = {Tajawal:'تجوّل (Tajawal)', Cairo:'القاهرة (Cairo)', system:'خط الجهاز (يعمل دون إنترنت)'};
 function applyTheme(){
-  var t = data.theme, r = document.documentElement.style;
-  r.setProperty('--h-mauve', t.mauve); r.setProperty('--h-rose', t.rose); r.setProperty('--h-sky', t.sky);
+  var t = data.theme, r = document.documentElement.style, hx = function(v, d){ return /^#[0-9a-f]{6}$/i.test(String(v)) ? v : d; };
+  r.setProperty('--h-mauve', hx(t.mauve, DEFAULT.theme.mauve)); r.setProperty('--h-rose', hx(t.rose, DEFAULT.theme.rose)); r.setProperty('--h-sky', hx(t.sky, DEFAULT.theme.sky));
   r.setProperty('--font-body', FONTS[t.font]||FONTS.Tajawal); r.setProperty('--font-head', FONTS[t.headFont]||FONTS.Cairo);
   r.setProperty('--base', (Number(t.scale)||17)+'px');
 }
@@ -1490,6 +1491,7 @@ function editItem(key, j, isNew){
 }
 
 /* ---------------- drawer (control panel) ---------------- */
+var SEC_EV = {login_ok:'دخول ناجح', login_fail:'محاولة دخول خاطئة', login_locked:'إيقاف الدخول مؤقتًا بعد محاولات خاطئة', logout:'خروج', logout_all:'خروج من كل الأجهزة', publish:'نشر', restore:'استرجاع نسخة سابقة', upload:'رفع ملف', files_cleanup:'حذف ملفات غير مستخدمة'};
 var TYPE_LABEL = {home:'الصفحة الرئيسية', accordion:'بطاقات قابلة للفتح', strategies:'بطاقات استراتيجيات', activities:'أنشطة تفاعلية', library:'مكتبة موارد'};
 var drawerTab = 'sections';
 function openDrawer(tab){ drawerTab = tab || drawerTab; renderDrawer(); $('#drawer').hidden = false; var c = $('#drawer .x'); if (c) c.focus(); }
@@ -1544,12 +1546,18 @@ function renderDrawer(){
       '<button type="button" class="btn ghost" data-act="export-json">'+icon('download')+' تنزيل المحتوى (JSON)</button>'+
       '<button type="button" class="btn ghost" data-act="import-json">استيراد محتوى من ملف JSON إلى المسودة</button>'+
       '<button type="button" class="btn ghost" data-act="export-html">'+icon('download')+' تنزيل نسخة من الموقع تعمل دون إنترنت (HTML)</button></div>'+
-      '<h3>الأمان</h3><p class="help">الدخول بكلمة مرور محفوظة سرًّا في إعدادات Cloudflare (ADMIN_PASSWORD). لتغييرها أو لإخراج كل الأجهزة من الحساب: غيّري قيمتها هناك، فتُلغى كل الجلسات القديمة تلقائيًا.</p>'+
+      '<h3>الأمان</h3><p class="help">الدخول بكلمة مرور محفوظة سرًّا في إعدادات Cloudflare (ADMIN_PASSWORD). تغيير كلمة المرور هناك يُبطل كل الجلسات القديمة تلقائيًا.</p>'+
+      '<div class="stack"><button type="button" class="btn ghost" data-act="logout-all">الخروج من كل الأجهزة</button>'+
+      '<button type="button" class="btn sm ghost" data-act="seclog">عرض سجل الأمان (آخر عمليات الدخول والنشر)</button><ul class="hist" id="seclog"></ul></div>'+
+      '<h3>الملفات المرفوعة</h3><p class="help" id="files-usage">—</p>'+
+      '<button type="button" class="btn sm ghost" data-act="files-cleanup">حذف الملفات غير المستخدمة</button>'+
+      '<p class="help">يُحذف فقط ما لا يظهر في المسودة ولا في المحتوى المنشور ولا في أي نسخة سابقة، ومضى على رفعه ساعة. استخدميه إن رفعتِ ملفًا بالخطأ ثم أزلتِه من الموقع.</p>'+
       '<h3>إعادة الضبط</h3><button type="button" class="btn danger" data-act="reset" style="width:100%">وضع المحتوى الافتراضي الأصلي في المسودة</button>';
   }
   $('#drawer').innerHTML = '<div class="dr-h"><h2>لوحة التحكم</h2><button type="button" class="x" data-act="drawer-close" aria-label="إغلاق لوحة التحكم">×</button></div>'+
     '<div class="dr-tabs" role="tablist">'+Object.keys(tabs).map(function(k){ return '<button type="button" class="dr-tab" role="tab" data-act="drawer" data-tab="'+k+'" aria-selected="'+(k===drawerTab)+'">'+tabs[k]+'</button>'; }).join('')+'</div>'+
     '<div class="dr-body">'+body+'</div>';
+  if (drawerTab === 'publish') api('GET', '/api/files').then(function(r){ var u = $('#files-usage'); if (u) u.textContent = 'عدد الملفات: '+ar(r.count)+' — الحجم: '+ar((r.bytes/1048576).toFixed(1))+' ميجابايت من ٥٠٠٠ ميجابايت المتاحة مجانًا.'; }).catch(function(){});
   var form = $('#add-sec');
   if (form) form.addEventListener('submit', function(e){
     e.preventDefault();
@@ -1715,6 +1723,23 @@ var ACT = {
     });
   },
   'export-html': function(){ exportHTML(); },
+  'logout-all': function(){
+    confirmBox('سيُطلب الدخول من جديد على كل الأجهزة، ومنها هذا الجهاز. هل تريدين المتابعة؟', 'الخروج من كل الأجهزة', true).then(function(ok){
+      if (!ok) return;
+      var go2 = function(){ api('POST', '/api/logout-all').then(function(){ location.href = '/'; }).catch(function(e){ toast(errMsg(e), 'err'); }); };
+      if (pendingSave || saving) saveDraft().then(go2); else go2();
+    }); },
+  seclog: function(){
+    var ul = $('#seclog'); ul.innerHTML = '<li class="help">جارٍ التحميل…</li>';
+    api('GET', '/api/log').then(function(r){
+      ul.innerHTML = r.items.length ? r.items.map(function(x){ return '<li><span>'+esc(SEC_EV[x.e]||x.e)+(x.c?' · '+esc(x.c):'')+'</span><span>'+esc(fmtDate(x.t))+' '+esc(fmtTime(x.t))+'</span></li>'; }).join('') : '<li class="help">لا توجد أحداث بعد.</li>';
+    }).catch(function(e){ ul.innerHTML = '<li class="err">'+esc(errMsg(e))+'</li>'; }); },
+  'files-cleanup': function(){
+    confirmBox('سيُحذف نهائيًا كل ملف مرفوع غير مستخدم في المسودة أو المنشور أو النسخ السابقة. هل تريدين المتابعة؟', 'حذف الملفات غير المستخدمة', true).then(function(ok){
+      if (!ok) return;
+      var run = function(){ api('POST', '/api/files/cleanup').then(function(r){ toast(r.deleted ? 'حُذف '+ar(r.deleted)+' ملفًا غير مستخدم' : 'لا توجد ملفات غير مستخدمة', 'ok'); renderDrawer(); }).catch(function(e){ toast(errMsg(e), 'err'); }); };
+      if (pendingSave || saving) saveDraft().then(run); else run();
+    }); },
   'export-json': function(){ download('nafidhat-alusra-backup.json', JSON.stringify(data, null, 2), 'application/json'); toast('تم تنزيل النسخة الاحتياطية'); },
   'import-json': function(){ importJSON(); },
   reset: function(){
