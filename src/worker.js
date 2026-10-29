@@ -17,6 +17,9 @@ const MAX_FILE_BYTES = 4 * 1024 * 1024;
 const CHUNK_BYTES = 1_500_000;          // أقل من حد الصف في D1 (2,000,000 بايت)
 const TEXT_CHUNK_CHARS = 400_000;       // العربية حتى 3 بايت للحرف → 1.2MB كحد أقصى للجزء
 const MAX_FAILS = 5, LOCK_MINUTES = 15, HISTORY_KEEP = 20;
+const GLOBAL_MAX_FAILS = 30, GLOBAL_WINDOW_MIN = 60;   // حد عام لكل المحاولات الخاطئة من أي جهاز
+const MAX_LOGIN_BODY = 2048, LOG_KEEP = 60, FILE_GRACE_MS = 60 * 60 * 1000;
+const HEX_COLOR = /^#[0-9a-f]{6}$/i, FONT_KEYS = new Set(["Tajawal", "Cairo", "system"]);
 
 const isZip = (b) => b[0] === 0x50 && b[1] === 0x4b && b[2] === 0x03 && b[3] === 0x04;
 const FILE_TYPES = {
@@ -96,7 +99,12 @@ const delStmt = (db, key) => db.prepare("DELETE FROM kv_chunks WHERE k = ?").bin
 
 /* ---------- الجلسات ---------- */
 const passwordConfigured = (env) => String(env.ADMIN_PASSWORD || "").length >= 10;
-async function passwordFingerprint(env) { return (await sha256hex("nafidha:" + String(env.ADMIN_PASSWORD || ""))).slice(0, 16); }
+async function hmacHex(env, text) {
+  const mac = new Uint8Array(await crypto.subtle.sign("HMAC", await hmacKey(env), enc.encode(text)));
+  return [...mac].map((x) => x.toString(16).padStart(2, "0")).join("");
+}
+/* بصمة كلمة المرور داخل الجلسة: HMAC بالمفتاح السري، فلا يمكن تخمين كلمة المرور منها خارج الخادم */
+async function passwordFingerprint(env) { return (await hmacHex(env, "pw:" + String(env.ADMIN_PASSWORD || ""))).slice(0, 32); }
 async function hmacKey(env) {
   let s = await getText(env.DB, "auth:secret");
   if (!s) {
@@ -118,7 +126,10 @@ async function verifyToken(env, token) {
   try { ok = await crypto.subtle.verify("HMAC", await hmacKey(env), fromB64url(mac || ""), enc.encode(body)); } catch { return null; }
   if (!ok) return null;
   let p; try { p = JSON.parse(new TextDecoder().decode(fromB64url(body))); } catch { return null; }
-  if (!p || typeof p.exp !== "number" || p.exp < Date.now() || p.fp !== (await passwordFingerprint(env))) return null;
+  if (!p || typeof p.exp !== "number" || p.exp < Date.now() || typeof p.sid !== "string" || p.fp !== (await passwordFingerprint(env))) return null;
+  /* الجلسة يجب أن تكون مسجّلة على الخادم؛ الخروج يحذفها فتبطل فورًا */
+  const row = await env.DB.prepare("SELECT 1 AS ok FROM kv_chunks WHERE k = ? LIMIT 1").bind("sess:" + p.sid).first();
+  if (!row) return null;
   return p;
 }
 function readCookie(req, name) {
@@ -128,7 +139,16 @@ function readCookie(req, name) {
   }
   return null;
 }
-async function isAdmin(req, env) { return passwordConfigured(env) && !!(await verifyToken(env, readCookie(req, COOKIE))); }
+async function currentSession(req, env) { return passwordConfigured(env) ? await verifyToken(env, readCookie(req, COOKIE)) : null; }
+async function isAdmin(req, env) { return !!(await currentSession(req, env)); }
+/* سجل أمان مختصر (آخر ٦٠ حدثًا): الوقت والحدث والدولة فقط، دون عناوين IP */
+async function logEvent(env, req, e) {
+  try {
+    const log = (await getJSON(env.DB, "log")) || [];
+    log.unshift({ t: new Date().toISOString(), e, c: (req.cf && req.cf.country) || req.headers.get("cf-ipcountry") || "" });
+    await env.DB.batch(putJSONStmts(env.DB, "log", log.slice(0, LOG_KEEP)));
+  } catch (err) { console.warn("log failed", err && err.message); }
+}
 const sessionCookie = (value, maxAge) => `${COOKIE}=${value}; Path=/api; HttpOnly; Secure; SameSite=Strict; Max-Age=${maxAge}`;
 function sameOrigin(req) {
   if (req.headers.get("x-requested-with") !== "nafidha") return false;
@@ -143,23 +163,36 @@ async function clientKey(req) {
 
 async function login(req, env) {
   if (!passwordConfigured(env)) return fail(503, "not_configured");
-  const db = env.DB, key = await clientKey(req);
+  if (Number(req.headers.get("content-length") || 0) > MAX_LOGIN_BODY) return fail(413, "too_large");
+  const db = env.DB, key = await clientKey(req), now = Date.now();
+  /* حد عام: يمنع التخمين الموزّع من أجهزة كثيرة */
+  let glob = (await getJSON(db, "fail:global")) || { n: 0, start: now };
+  if (now - glob.start > GLOBAL_WINDOW_MIN * 60000) glob = { n: 0, start: now };
+  if (glob.n >= GLOBAL_MAX_FAILS) return fail(429, "locked", { minutes: Math.ceil((glob.start + GLOBAL_WINDOW_MIN * 60000 - now) / 60000) });
   let rec = (await getJSON(db, key)) || { n: 0, until: 0 };
-  if (rec.until && rec.until <= Date.now()) rec = { n: 0, until: 0 };
-  if (rec.until > Date.now()) return fail(429, "locked", { minutes: Math.ceil((rec.until - Date.now()) / 60000) });
-  let body; try { body = await req.json(); } catch { return fail(400, "bad_request"); }
+  if (rec.until && rec.until <= now) rec = { n: 0, until: 0 };
+  if (rec.until > now) return fail(429, "locked", { minutes: Math.ceil((rec.until - now) / 60000) });
+  const raw = await req.text();
+  if (enc.encode(raw).length > MAX_LOGIN_BODY) return fail(413, "too_large");
+  let body; try { body = JSON.parse(raw); } catch { return fail(400, "bad_request"); }
   const given = await sha256hex(String((body && body.password) || ""));
   const real = await sha256hex(String(env.ADMIN_PASSWORD));
   if (!safeEqual(given, real)) {
-    rec.n += 1;
-    if (rec.n >= MAX_FAILS) rec = { n: 0, until: Date.now() + LOCK_MINUTES * 60000 };
-    await db.batch(putJSONStmts(db, key, rec));
+    rec.n += 1; glob.n += 1;
+    if (rec.n >= MAX_FAILS) rec = { n: 0, until: now + LOCK_MINUTES * 60000 };
+    await db.batch([...putJSONStmts(db, key, rec), ...putJSONStmts(db, "fail:global", glob)]);
+    await logEvent(env, req, rec.until ? "login_locked" : "login_fail");
     await sleep(400);
     if (rec.until) return fail(429, "locked", { minutes: LOCK_MINUTES });
     return fail(401, "wrong_password", { left: MAX_FAILS - rec.n });
   }
-  await delStmt(db, key).run();
-  const token = await signToken(env, { exp: Date.now() + SESSION_DAYS * 864e5, fp: await passwordFingerprint(env), iat: Date.now() });
+  const sid = randomHex(24), exp = now + SESSION_DAYS * 864e5;
+  /* تنظيف الجلسات المنتهية ثم تسجيل الجلسة الجديدة */
+  const { results } = await db.prepare("SELECT k, v FROM kv_chunks WHERE k LIKE 'sess:%'").all();
+  const expired = (results || []).filter((r) => { try { return JSON.parse(r.v).exp < now; } catch { return true; } }).map((r) => delStmt(db, r.k));
+  await db.batch([delStmt(db, key), ...expired, ...putJSONStmts(db, "sess:" + sid, { exp, iat: now })]);
+  const token = await signToken(env, { sid, exp, fp: await passwordFingerprint(env), iat: now });
+  await logEvent(env, req, "login_ok");
   return json({ ok: true }, 200, { "set-cookie": sessionCookie(token, SESSION_DAYS * 86400) });
 }
 
@@ -170,8 +203,24 @@ function cleanContent(c) {
   if (c.sections.length > 60) throw new Error("invalid");
   for (const s of c.sections) if (!s || typeof s !== "object" || typeof s.id !== "string" || !Array.isArray(s.items)) throw new Error("invalid");
   delete c.editorPin; delete c.recoveryHash; delete c.locked;
+  /* الألوان والخطوط: قيم محددة فقط، لمنع حقن CSS */
+  if (c.theme && typeof c.theme === "object") {
+    const t = c.theme;
+    for (const k of ["mauve", "rose", "sky"]) if (k in t && !HEX_COLOR.test(String(t[k]))) delete t[k];
+    for (const k of ["font", "headFont"]) if (k in t && !FONT_KEYS.has(t[k])) delete t[k];
+    if ("scale" in t) { const n = Number(t.scale); if (!(n >= 13 && n <= 24)) delete t.scale; else t.scale = n; }
+  } else delete c.theme;
   return c;
 }
+/* النسخة العامة: تُحذف منها الأقسام والعناصر والإعلانات المخفية قبل وصولها للزوار */
+function publicView(content) {
+  const c = JSON.parse(JSON.stringify(content));
+  c.sections = (c.sections || []).filter((s) => s.type === "home" || !s.hidden);
+  for (const s of c.sections) s.items = (s.items || []).filter((it) => it && !it.hidden);
+  if (Array.isArray(c.announcements)) c.announcements = c.announcements.filter((a) => a && !a.hidden);
+  return c;
+}
+const fileRefs = (text) => new Set([...String(text || "").matchAll(/\/api\/file\/([0-9a-f-]{36})/g)].map((m) => m[1]));
 async function readJSONBody(req, limit) {
   const text = await req.text();
   if (enc.encode(text).length > limit) { const e = new Error("too_large"); e.code = 413; throw e; }
@@ -247,10 +296,15 @@ async function handleApi(req, env) {
   /* عامة */
   if (path === "session" && method === "GET") return json({ admin: await isAdmin(req, env), configured: passwordConfigured(env) });
   if (path === "login" && method === "POST") return login(req, env);
-  if (path === "logout" && method === "POST") return json({ ok: true }, 200, { "set-cookie": sessionCookie("", 0) });
+  if (path === "logout" && method === "POST") {
+    const s = await currentSession(req, env);
+    if (s) { await delStmt(env.DB, "sess:" + s.sid).run(); await logEvent(env, req, "logout"); }
+    return json({ ok: true }, 200, { "set-cookie": sessionCookie("", 0) });
+  }
   if (path === "content" && method === "GET") {
-    const pub = await getJSON(env.DB, "published");
-    return json(pub || { content: null, publishedAt: null }, 200, { "cache-control": "public, max-age=0, must-revalidate" });
+    let out = await getText(env.DB, "public");
+    if (!out) { const pub = await getJSON(env.DB, "published"); out = JSON.stringify(pub ? { content: publicView(pub.content), publishedAt: pub.publishedAt } : { content: null, publishedAt: null }); }
+    return new Response(out, { status: 200, headers: { "content-type": "application/json; charset=utf-8", "cache-control": "public, max-age=0, must-revalidate", ...SECURITY_HEADERS } });
   }
   if (path.startsWith("file/") && method === "GET") return serveFile(env, path.slice(5));
 
@@ -285,10 +339,12 @@ async function handleApi(req, env) {
     const publishedAt = new Date().toISOString();
     const stmts = [];
     if (pubText) { const old = JSON.parse(pubText); if (old.publishedAt) stmts.push(...putTextStmts(db, "h:" + old.publishedAt, pubText)); }
-    stmts.push(...putJSONStmts(db, "published", { content: draft.content, publishedAt }), delStmt(db, "draft"));
+    stmts.push(...putJSONStmts(db, "published", { content: draft.content, publishedAt }),
+      ...putJSONStmts(db, "public", { content: publicView(draft.content), publishedAt }), delStmt(db, "draft"));
     await db.batch(stmts);   // عملية واحدة: إما تنجح كلها أو لا يتغير شيء
     const keys = await historyKeys(db);
     if (keys.length > HISTORY_KEEP) await db.batch(keys.slice(HISTORY_KEEP).map((k) => delStmt(db, k)));
+    await logEvent(env, req, "publish");
     return json({ ok: true, publishedAt });
   }
   if (path === "history" && method === "GET") {
@@ -302,19 +358,47 @@ async function handleApi(req, env) {
     if (!old) return fail(404, "not_found");
     const savedAt = new Date().toISOString();
     await db.batch(putJSONStmts(db, "draft", { content: old.content, savedAt }));
+    await logEvent(env, req, "restore");
     return json({ ok: true, savedAt, content: old.content });
   }
-  if (path === "upload" && method === "POST") return upload(req, env);
+  if (path === "upload" && method === "POST") { const r = await upload(req, env); if (r.ok) await logEvent(env, req, "upload"); return r; }
+  if (path === "logout-all" && method === "POST") {
+    await db.prepare("DELETE FROM kv_chunks WHERE k LIKE 'sess:%'").run();
+    await logEvent(env, req, "logout_all");
+    return json({ ok: true }, 200, { "set-cookie": sessionCookie("", 0) });
+  }
+  if (path === "log" && method === "GET") return json({ items: (await getJSON(db, "log")) || [] });
+  if (path === "files" && method === "GET") {
+    const r = await db.prepare("SELECT COUNT(*) AS n, COALESCE(SUM(size), 0) AS bytes FROM files").first();
+    return json({ count: r.n, bytes: r.bytes });
+  }
+  if (path === "files/cleanup" && method === "POST") {
+    /* يحذف فقط الملفات غير المستخدمة في المسودة أو المنشور أو أي نسخة سابقة، والتي مضى على رفعها ساعة */
+    const used = new Set();
+    for (const k of ["draft", "published", ...(await historyKeys(db))]) for (const id of fileRefs(await getText(db, k))) used.add(id);
+    const { results } = await db.prepare("SELECT id, size, created_at FROM files").all();
+    const cutoff = Date.now() - Number(env.FILE_GRACE_MS ?? FILE_GRACE_MS);
+    const victims = (results || []).filter((f) => !used.has(f.id) && Date.parse(f.created_at) < cutoff);
+    for (let i = 0; i < victims.length; i += 20) {
+      const part = victims.slice(i, i + 20);
+      await db.batch(part.flatMap((f) => [db.prepare("DELETE FROM file_chunks WHERE file_id = ?").bind(f.id), db.prepare("DELETE FROM files WHERE id = ?").bind(f.id)]));
+    }
+    if (victims.length) await logEvent(env, req, "files_cleanup");
+    return json({ ok: true, deleted: victims.length, bytes: victims.reduce((a, f) => a + f.size, 0) });
+  }
   return fail(404, "not_found");
 }
 
 export default {
   async fetch(req, env) {
     const url = new URL(req.url);
+    if (url.protocol === "http:" && !/^(localhost|127\.0\.0\.1|\[::1\])$/.test(url.hostname)) {
+      url.protocol = "https:"; return Response.redirect(url.toString(), 308);
+    }
     if (url.pathname === "/api" || url.pathname.startsWith("/api/")) {
       try { return await handleApi(req, env); }
       catch (e) {
-        if (e && e.code) return fail(e.code, e.message);
+        if (e && Number.isInteger(e.code) && e.code >= 400 && e.code < 600) return fail(e.code, e.message);
         if (e && e.message === "invalid") return fail(400, "invalid_content");
         console.error(e);
         return fail(500, "server_error");
